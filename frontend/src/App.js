@@ -1,4 +1,5 @@
 import React from 'react';
+import getConfig from './config.js'
 import * as nearAPI from 'near-api-js';
 import { generateSeedPhrase } from 'near-seed-phrase';
 
@@ -54,12 +55,7 @@ class App extends React.Component {
   }
 
   async initNear() {
-    const nearConfig = {
-      networkId: 'default',
-      nodeUrl: 'https://rpc.testnet.nearprotocol.com',
-      contractName: FaucetName,
-      walletUrl: 'https://wallet.testnet.near.org',
-    };
+    const nearConfig = getConfig(process.env.NODE_ENV || 'testnet')
     const keyStore = new nearAPI.keyStores.BrowserLocalStorageKeyStore();
     const near = await nearAPI.connect(Object.assign({ deps: { keyStore } }, nearConfig));
     this._keyStore = keyStore;
