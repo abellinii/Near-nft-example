@@ -1,268 +1,398 @@
+#![deny(warnings)]
+
 use borsh::{BorshDeserialize, BorshSerialize};
+use near_sdk::collections::UnorderedMap;
 use near_sdk::collections::UnorderedSet;
-use near_sdk::{env, near_bindgen, Promise, PromiseOrValue};
+use near_sdk::{env, near_bindgen, AccountId};
 
 #[global_allocator]
 static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
 
-pub type AccountId = String;
-pub type PublicKey = Vec<u8>;
-pub type Salt = u64;
+/// This trait provides the baseline of functions as described at:
+/// https://github.com/nearprotocol/NEPs/blob/nep-4/specs/Standards/Tokens/NonFungibleToken.md
+pub trait NEP4 {
+    // Grant the access to the given `accountId` for the given `tokenId`.
+    // Requirements:
+    // * The caller of the function (`predecessor_id`) should have access to the token.
+    fn grant_access(&mut self, escrow_account_id: AccountId);
 
-/// A Faucet contract that creates and funds accounts if the caller provides basic proof of work
-/// to avoid sybil attacks and draining balance too fast.
-/// The new account always receives 1/1000 of the remaining balance.
-/// Proof of Work works the following way:
-/// You need to compute a u64 salt (nonce) for a given account and a given public key in such a way
-/// that the `sha256(account_id + ':' + public_key + ':' + salt)` has more leading zero bits than
-/// the required `min_difficulty`.
+    // Revoke the access to the given `accountId` for the given `tokenId`.
+    // Requirements:
+    // * The caller of the function (`predecessor_id`) should have access to the token.
+    fn revoke_access(&mut self, escrow_account_id: AccountId);
+
+    // Transfer the given `tokenId` to the given `accountId`. Account `accountId` becomes the new owner.
+    // Requirements:
+    // * The caller of the function (`predecessor_id`) should have access to the token.
+    fn transfer_from(&mut self, owner_id: AccountId, new_owner_id: AccountId, token_id: TokenId); 
+
+    // Transfer the given `tokenId` to the given `accountId`. Account `accountId` becomes the new owner.
+    // Requirements:
+    // * The caller of the function (`predecessor_id`) should be the owner of the token. Callers who have
+    // escrow access should use transfer_from.
+    fn transfer(&mut self, new_owner_id: AccountId, token_id: TokenId); 
+
+    // Returns `true` or `false` based on caller of the function (`predecessor_id) having access to the token
+    fn check_access(&self, account_id: AccountId) -> bool;
+
+    // Get an individual owner by given `tokenId`.
+    fn get_token_owner(&self, token_id: TokenId) -> String;
+}
+
+/// The token ID type is also defined in the NEP
+pub type TokenId = u64;
+pub type AccountIdHash = Vec<u8>;
+
+// Begin implementation
 #[near_bindgen]
 #[derive(BorshDeserialize, BorshSerialize)]
-pub struct Faucet {
-    /// Account ID which will be a suffix for each account (including a '.' separator).
-    pub account_suffix: AccountId,
-    /// Number of leading zeros in binary representation for a hash
-    pub min_difficulty: u32,
-    /// Created accounts
-    pub created_accounts: UnorderedSet<AccountId>,
+pub struct NonFungibleTokenBasic {
+    pub token_to_account: UnorderedMap<TokenId, AccountId>,
+    pub account_gives_access: UnorderedMap<AccountIdHash, UnorderedSet<AccountIdHash>>, // Vec<u8> is sha256 of account, makes it safer and is how fungible token also works
+    pub owner_id: AccountId,
 }
 
-impl Default for Faucet {
+impl Default for NonFungibleTokenBasic {
     fn default() -> Self {
-        panic!("Faucet is not initialized yet")
+        panic!("NFT should be initialized before usage")
     }
-}
-
-/// Returns the number of leading zero bits for a given slice of bits.
-fn num_leading_zeros(v: &[u8]) -> u32 {
-    let mut res = 0;
-    for z in v.iter().map(|b| b.leading_zeros()) {
-        res += z;
-        if z < 8 {
-            break;
-        }
-    }
-    res
-}
-
-fn assert_self() {
-    assert_eq!(
-        env::current_account_id(),
-        env::predecessor_account_id(),
-        "Can only be called by owner"
-    );
 }
 
 #[near_bindgen]
-impl Faucet {
+impl NonFungibleTokenBasic {
     #[init]
-    pub fn new(account_suffix: AccountId, min_difficulty: u32) -> Self {
-        assert!(env::state_read::<Self>().is_none(), "Already initialized");
+    pub fn new(owner_id: AccountId) -> Self {
+        assert!(env::is_valid_account_id(owner_id.as_bytes()), "Owner's account ID is invalid.");
+        assert!(!env::state_exists(), "Already initialized");
         Self {
-            account_suffix,
-            min_difficulty,
-            created_accounts: UnorderedSet::new(b"a".to_vec()),
+            token_to_account: UnorderedMap::new(b"token-belongs-to".to_vec()),
+            account_gives_access: UnorderedMap::new(b"gives-access".to_vec()),
+            owner_id,
         }
-    }
-
-    pub fn get_account_suffix(&self) -> AccountId {
-        self.account_suffix.clone()
-    }
-
-    pub fn get_min_difficulty(&self) -> u32 {
-        self.min_difficulty
-    }
-
-    pub fn get_num_created_accounts(&self) -> u64 {
-        self.created_accounts.len()
-    }
-
-    pub fn create_account(
-        &mut self,
-        account_id: AccountId,
-        public_key: PublicKey,
-        salt: Salt,
-    ) -> PromiseOrValue<()> {
-        // Checking account_id suffix first.
-        assert!(
-            account_id.ends_with(&self.account_suffix),
-            "Account has to end with the suffix"
-        );
-
-        // Checking that the given account is not created yet.
-        assert!(
-            !self.created_accounts.contains(&account_id),
-            "The given given account is already created"
-        );
-
-        // Checking proof of work
-        //     Constructing a message for checking
-        let mut message = account_id.as_bytes().to_vec();
-        message.push(b':');
-        message.extend_from_slice(&public_key);
-        message.push(b':');
-        message.extend_from_slice(&salt.to_le_bytes());
-        //     Computing hash of the message
-        let hash = env::sha256(&message);
-        //     Checking that the resulting hash has enough leading zeros.
-        assert!(
-            num_leading_zeros(&hash) >= self.min_difficulty,
-            "The proof is work is too weak"
-        );
-
-        // All checks are good, let's proceed by creating an account
-
-        // Save that we already has created an account.
-        self.created_accounts.insert(&account_id);
-
-        // Creating new account. It still can fail (e.g. account already exists or name is invalid),
-        // but we don't care, we'll get a refund back.
-        Promise::new(account_id)
-            .create_account()
-            .transfer(env::account_balance() / 1000)
-            .add_full_access_key(public_key)
-            .into()
-    }
-
-    // Owner's methods. Can only be called by the owner
-
-    pub fn set_min_difficulty(&mut self, min_difficulty: u32) {
-        assert_self();
-        self.min_difficulty = min_difficulty;
-    }
-
-    pub fn add_access_key(&mut self, public_key: PublicKey) -> PromiseOrValue<()> {
-        assert_self();
-        Promise::new(env::current_account_id())
-            .add_access_key(
-                public_key,
-                0,
-                env::current_account_id(),
-                b"create_account".to_vec(),
-            )
-            .into()
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(test)]
-mod tests {
-    use near_sdk::MockedBlockchain;
-    use near_sdk::{testing_env, VMContext};
-    use std::panic;
+#[near_bindgen]
+impl NEP4 for NonFungibleTokenBasic {
+    fn grant_access(&mut self, escrow_account_id: AccountId) {
+        let escrow_hash = env::sha256(escrow_account_id.as_bytes());
+        let predecessor = env::predecessor_account_id();
+        let predecessor_hash = env::sha256(predecessor.as_bytes());
 
-    use super::*;
-
-    fn catch_unwind_silent<F: FnOnce() -> R + panic::UnwindSafe, R>(
-        f: F,
-    ) -> std::thread::Result<R> {
-        let prev_hook = panic::take_hook();
-        panic::set_hook(Box::new(|_| {}));
-        let result = panic::catch_unwind(f);
-        panic::set_hook(prev_hook);
-        result
+        let mut access_set = match self.account_gives_access.get(&predecessor_hash) {
+            Some(existing_set) => {
+                existing_set
+            },
+            None => {
+                UnorderedSet::new(b"new-access-set".to_vec())
+            }
+        };
+        access_set.insert(&escrow_hash);
+        self.account_gives_access.insert(&predecessor_hash, &access_set);
     }
 
-    fn get_context() -> VMContext {
+    fn revoke_access(&mut self, escrow_account_id: AccountId) {
+        let predecessor = env::predecessor_account_id();
+        let predecessor_hash = env::sha256(predecessor.as_bytes());
+        let mut existing_set = match self.account_gives_access.get(&predecessor_hash) {
+            Some(existing_set) => existing_set,
+            None => env::panic(b"Access does not exist.")
+        };
+        let escrow_hash = env::sha256(escrow_account_id.as_bytes());
+        if existing_set.contains(&escrow_hash) {
+            existing_set.remove(&escrow_hash);
+            self.account_gives_access.insert(&predecessor_hash, &existing_set);
+            env::log(b"Successfully removed access.")
+        } else {
+            env::panic(b"Did not find access for escrow ID.")
+        }
+    }
+
+    fn transfer(&mut self, new_owner_id: AccountId, token_id: TokenId) {
+        let token_owner_account_id = self.get_token_owner(token_id);
+        let predecessor = env::predecessor_account_id();
+        if predecessor != token_owner_account_id {
+            env::panic(b"Attempt to call transfer on tokens belonging to another account.")
+        }
+        self.token_to_account.insert(&token_id, &new_owner_id);
+    }
+
+    fn transfer_from(&mut self, owner_id: AccountId, new_owner_id: AccountId, token_id: TokenId) {
+        let token_owner_account_id = self.get_token_owner(token_id);
+        if owner_id != token_owner_account_id {
+            env::panic(b"Attempt to transfer a token from a different owner.")
+        }
+
+        if !self.check_access(token_owner_account_id) {
+            env::panic(b"Attempt to transfer a token with no access.")
+        }
+        self.token_to_account.insert(&token_id, &new_owner_id);
+    }
+
+    fn check_access(&self, account_id: AccountId) -> bool {
+        let account_hash = env::sha256(account_id.as_bytes());
+        let predecessor = env::predecessor_account_id();
+        if predecessor == account_id {
+            return true;
+        }
+        match self.account_gives_access.get(&account_hash) {
+            Some(access) => {
+                let predecessor = env::predecessor_account_id();
+                let predecessor_hash = env::sha256(predecessor.as_bytes());
+                access.contains(&predecessor_hash)
+            },
+            None => false
+        }
+    }
+
+    fn get_token_owner(&self, token_id: TokenId) -> String {
+        match self.token_to_account.get(&token_id) {
+            Some(owner_id) => owner_id,
+            None => env::panic(b"No owner of the token ID specified")
+        }
+    }
+}
+
+/// Methods not in the strict scope of the NFT spec (NEP4)
+#[near_bindgen]
+impl NonFungibleTokenBasic {
+    /// Creates a token for owner_id, doesn't use autoincrement, fails if id is taken
+    pub fn mint_token(&mut self, owner_id: String, token_id: TokenId) {
+        // make sure that only the owner can call this funtion
+        self.only_owner();
+        // Since Map doesn't have `contains` we use match
+        let token_check = self.token_to_account.get(&token_id);
+        if token_check.is_some() {
+            env::panic(b"Token ID already exists.")
+        }
+        // No token with that ID exists, mint and add token to data structures
+        self.token_to_account.insert(&token_id, &owner_id);
+    }
+
+    /// helper function determining contract ownership
+    fn only_owner(&mut self) {
+        assert_eq!(env::predecessor_account_id(), self.owner_id, "Only contract owner can call this method.");
+    }
+}
+
+// use the attribute below for unit tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use near_sdk::MockedBlockchain;
+    use near_sdk::{testing_env, VMContext};
+
+    fn joe() -> AccountId {
+        "joe.testnet".to_string()
+    }
+    fn robert() -> AccountId {
+        "robert.testnet".to_string()
+    }
+    fn mike() -> AccountId {
+        "mike.testnet".to_string()
+    }
+
+    // part of writing unit tests is setting up a mock context
+    // this is a useful list to peek at when wondering what's available in env::*
+    fn get_context(predecessor_account_id: String, storage_usage: u64) -> VMContext {
         VMContext {
-            current_account_id: "alice".to_string(),
-            signer_account_id: "bob".to_string(),
+            current_account_id: "alice.testnet".to_string(),
+            signer_account_id: "jane.testnet".to_string(),
             signer_account_pk: vec![0, 1, 2],
-            predecessor_account_id: "bob".to_string(),
+            predecessor_account_id,
             input: vec![],
             block_index: 0,
             block_timestamp: 0,
             account_balance: 0,
             account_locked_balance: 0,
-            storage_usage: 10u64.pow(6),
+            storage_usage,
             attached_deposit: 0,
-            prepaid_gas: 10u64.pow(15),
+            prepaid_gas: 10u64.pow(18),
             random_seed: vec![0, 1, 2],
             is_view: false,
             output_data_receivers: vec![],
-            epoch_height: 0,
+            epoch_height: 19,
         }
     }
 
     #[test]
-    fn test_new() {
-        let context = get_context();
+    fn grant_access() {
+        let context = get_context(robert(), 0);
         testing_env!(context);
-        let account_suffix = ".alice".to_string();
-        let min_difficulty = 5;
-        let contract = Faucet::new(account_suffix.clone(), min_difficulty);
-        assert_eq!(contract.get_account_suffix(), account_suffix);
-        assert_eq!(contract.get_min_difficulty(), min_difficulty);
-        assert_eq!(contract.get_num_created_accounts(), 0);
+        let mut contract = NonFungibleTokenBasic::new(robert());
+        let length_before = contract.account_gives_access.len();
+        assert_eq!(0, length_before, "Expected empty account access Map.");
+        contract.grant_access(mike());
+        contract.grant_access(joe());
+        let length_after = contract.account_gives_access.len();
+        assert_eq!(1, length_after, "Expected an entry in the account's access Map.");
+        let predecessor_hash = env::sha256(robert().as_bytes());
+        let num_grantees = contract.account_gives_access.get(&predecessor_hash).unwrap();
+        assert_eq!(2, num_grantees.len(), "Expected two accounts to have access to predecessor.");
     }
 
     #[test]
-    fn test_create_account_ok() {
-        let context = get_context();
+    #[should_panic(
+        expected = r#"Access does not exist."#
+    )]
+    fn revoke_access_and_panic() {
+        let context = get_context(robert(), 0);
         testing_env!(context);
-        let account_suffix = ".alice".to_string();
-        let min_difficulty = 20;
-        let mut contract = Faucet::new(account_suffix.clone(), min_difficulty);
-        let account_id = "test.alice";
-        let public_key = vec![0u8; 33];
-        let salt = 89949;
-        contract.create_account(account_id.to_string(), public_key, salt);
-        assert_eq!(contract.get_num_created_accounts(), 1);
+        let mut contract = NonFungibleTokenBasic::new(robert());
+        contract.revoke_access(joe());
     }
 
     #[test]
-    fn test_fail_default() {
-        let context = get_context();
+    fn add_revoke_access_and_check() {
+        // Joe grants access to Robert
+        let mut context = get_context(joe(), 0);
         testing_env!(context);
-        catch_unwind_silent(|| {
-            Faucet::default();
-        })
-        .unwrap_err();
+        let mut contract = NonFungibleTokenBasic::new(joe());
+        contract.grant_access(robert());
+
+        // does Robert have access to Joe's account? Yes.
+        context = get_context(robert(), env::storage_usage());
+        testing_env!(context);
+        let mut robert_has_access = contract.check_access(joe());
+        assert_eq!(true, robert_has_access, "After granting access, check_access call failed.");
+
+        // Joe revokes access from Robert
+        context = get_context(joe(), env::storage_usage());
+        testing_env!(context);
+        contract.revoke_access(robert());
+
+        // does Robert have access to Joe's account? No
+        context = get_context(robert(), env::storage_usage());
+        testing_env!(context);
+        robert_has_access = contract.check_access(joe());
+        assert_eq!(false, robert_has_access, "After revoking access, check_access call failed.");
     }
 
     #[test]
-    fn test_fail_create_account_bad_name() {
-        let context = get_context();
+    fn mint_token_get_token_owner() {
+        let context = get_context(robert(), 0);
         testing_env!(context);
-        let account_suffix = ".alice".to_string();
-        let min_difficulty = 0;
-        let mut contract = Faucet::new(account_suffix.clone(), min_difficulty);
-        let account_id = "bob";
-        let public_key = vec![0u8; 33];
-        let salt = 0;
-        catch_unwind_silent(move || {
-            contract.create_account(account_id.to_string(), public_key, salt);
-        })
-        .unwrap_err();
+        let mut contract = NonFungibleTokenBasic::new(robert());
+        contract.mint_token(mike(), 19u64);
+        let owner = contract.get_token_owner(19u64);
+        assert_eq!(mike(), owner, "Unexpected token owner.");
     }
 
     #[test]
-    fn test_fail_create_account_already_created() {
-        let context = get_context();
+    #[should_panic(
+        expected = r#"Attempt to transfer a token with no access."#
+    )]
+    fn transfer_from_with_no_access_should_fail() {
+        // Mike owns the token.
+        // Robert is trying to transfer it to Robert's account without having access.
+        let context = get_context(robert(), 0);
         testing_env!(context);
-        let account_suffix = ".alice".to_string();
-        let min_difficulty = 10;
-        let mut contract = Faucet::new(account_suffix.clone(), min_difficulty);
-        let account_id = "test.alice";
-        let public_key = vec![0u8; 33];
-        let salt = 123;
-        contract.create_account(account_id.to_string(), public_key.clone(), salt);
-        catch_unwind_silent(move || {
-            contract.create_account(account_id.to_string(), public_key, salt);
-        })
-        .unwrap_err();
+        let mut contract = NonFungibleTokenBasic::new(robert());
+        let token_id = 19u64;
+        contract.mint_token(mike(), token_id);
+        contract.transfer_from(mike(), robert(), token_id.clone());
     }
 
     #[test]
-    fn test_num_leading_zeros() {
-        assert_eq!(num_leading_zeros(&[0u8; 4]), 32);
-        assert_eq!(num_leading_zeros(&[255u8; 4]), 0);
-        assert_eq!(num_leading_zeros(&[254u8; 4]), 0);
-        assert_eq!(num_leading_zeros(&[]), 0);
-        assert_eq!(num_leading_zeros(&[127u8]), 1);
-        assert_eq!(num_leading_zeros(&[0u8; 32]), 256);
-        assert_eq!(num_leading_zeros(&[1u8; 4]), 7);
-        assert_eq!(num_leading_zeros(&[0u8, 0u8, 255u8 >> 3]), 19);
-        assert_eq!(num_leading_zeros(&[0u8, 0u8, 255u8 >> 3, 0u8]), 19);
+    fn transfer_from_with_escrow_access() {
+        // Escrow account: robert.testnet
+        // Owner account: mike.testnet
+        // New owner account: joe.testnet
+        let mut context = get_context(mike(), 0);
+        testing_env!(context);
+        let mut contract = NonFungibleTokenBasic::new(mike());
+        let token_id = 19u64;
+        contract.mint_token(mike(), token_id);
+        // Mike grants access to Robert
+        contract.grant_access(robert());
+
+        // Robert transfers the token to Joe
+        context = get_context(robert(), env::storage_usage());
+        testing_env!(context);
+        contract.transfer_from(mike(), joe(), token_id.clone());
+
+        // Check new owner
+        let owner = contract.get_token_owner(token_id.clone());
+        assert_eq!(joe(), owner, "Token was not transferred after transfer call with escrow.");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = r#"Attempt to transfer a token from a different owner."#
+    )]
+    fn transfer_from_with_escrow_access_wrong_owner_id() {
+        // Escrow account: robert.testnet
+        // Owner account: mike.testnet
+        // New owner account: joe.testnet
+        let mut context = get_context(mike(), 0);
+        testing_env!(context);
+        let mut contract = NonFungibleTokenBasic::new(mike());
+        let token_id = 19u64;
+        contract.mint_token(mike(), token_id);
+        // Mike grants access to Robert
+        contract.grant_access(robert());
+
+        // Robert transfers the token to Joe
+        context = get_context(robert(), env::storage_usage());
+        testing_env!(context);
+        contract.transfer_from(robert(), joe(), token_id.clone());
+    }
+
+    #[test]
+    fn transfer_from_with_your_own_token() {
+        // Owner account: robert.testnet
+        // New owner account: joe.testnet
+
+        testing_env!(get_context(robert(), 0));
+        let mut contract = NonFungibleTokenBasic::new(robert());
+        let token_id = 19u64;
+        contract.mint_token(robert(), token_id);
+
+        // Robert transfers the token to Joe
+        contract.transfer_from(robert(), joe(), token_id.clone());
+
+        // Check new owner
+        let owner = contract.get_token_owner(token_id.clone());
+        assert_eq!(joe(), owner, "Token was not transferred after transfer call with escrow.");
+    }
+
+    #[test]
+    #[should_panic(
+        expected = r#"Attempt to call transfer on tokens belonging to another account."#
+    )]
+    fn transfer_with_escrow_access_fails() {
+        // Escrow account: robert.testnet
+        // Owner account: mike.testnet
+        // New owner account: joe.testnet
+        let mut context = get_context(mike(), 0);
+        testing_env!(context);
+        let mut contract = NonFungibleTokenBasic::new(mike());
+        let token_id = 19u64;
+        contract.mint_token(mike(), token_id);
+        // Mike grants access to Robert
+        contract.grant_access(robert());
+
+        // Robert transfers the token to Joe
+        context = get_context(robert(), env::storage_usage());
+        testing_env!(context);
+        contract.transfer(joe(), token_id.clone());
+    }
+
+    #[test]
+    fn transfer_with_your_own_token() {
+        // Owner account: robert.testnet
+        // New owner account: joe.testnet
+
+        testing_env!(get_context(robert(), 0));
+        let mut contract = NonFungibleTokenBasic::new(robert());
+        let token_id = 19u64;
+        contract.mint_token(robert(), token_id);
+
+        // Robert transfers the token to Joe
+        contract.transfer(joe(), token_id.clone());
+
+        // Check new owner
+        let owner = contract.get_token_owner(token_id.clone());
+        assert_eq!(joe(), owner, "Token was not transferred after transfer call with escrow.");
     }
 }
